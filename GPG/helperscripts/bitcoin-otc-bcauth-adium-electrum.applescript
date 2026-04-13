@@ -63,4 +63,5 @@ end tell
 tell application "Adium"
 	activate
 	send the active chat message "/msg gribble voiceme"
+	send the active chat message "/join #bitcoin-otc"
 end tell
