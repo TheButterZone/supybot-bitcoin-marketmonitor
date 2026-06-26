@@ -30,10 +30,7 @@
 
 import supybot.utils as utils
 from supybot.commands import *
-import supybot.plugins as plugins
-import supybot.ircutils as ircutils
 import supybot.callbacks as callbacks
-from supybot import conf
 from supybot import world
 from supybot.utils.seq import dameraulevenshtein
 
@@ -42,6 +39,7 @@ import json
 import urllib2
 import time
 import traceback
+import inspect
 
 opener = urllib2.build_opener()
 opener.addheaders = [('User-Agent', 'Mozilla/5.0 (X11; Linux x86_64; rv:22.0) Gecko/20100101 Firefox/22.0')]
@@ -97,14 +95,44 @@ class Market(callbacks.Plugin):
         self.depth_cache = {}
         self.currency_cache = {}
         self.ticker_cache = {}
-        self.ticker_supported_markets = {'btce':'BTC-E', 'btsp':'Bitstamp',
-                'bfx':'Bitfinex', 'btcde':'Bitcoin.de', 'cbx':'CampBX',
-                'btcn':'BTCChina', 'btcavg':'BitcoinAverage', 'coinbase':'Coinbase',
-                'krk':'Kraken', 'bitmynt':'bitmynt.no', 'bcent':'Bitcoin-Central',
-                'okc':'OKCoin'}
-        self.depth_supported_markets = {'btsp':'Bitstamp', 'krk':'Kraken',
-                'btcn':'BTCChina', 'bcent':'Bitcoin-Central', 'bfx':'Bitfinex',
-                'btce':'BTC-E'}
+        self.ticker_supported_markets = {
+            'bcent': 'Bitcoin-Central',
+            'bfx': 'Bitfinex',
+            'bitmynt': 'bitmynt.no',
+            'btcavg': 'BitcoinAverage',
+            'btcde': 'Bitcoin.de',
+            'btce': 'BTC-E',
+            'wex': 'WEX',
+            'btcn': 'BTCChina',
+            'btsp': 'Bitstamp',
+            'cbx': 'CampBX',
+            'coinbase': 'Coinbase',
+            'gdax': 'GDAX',
+            'gem': 'Gemini',
+            'krk': 'Kraken',
+            'okc': 'OKCoin'
+        }
+        self.depth_supported_markets = {
+            'bcent': 'Bitcoin-Central',
+            'btce': 'BTC-E',
+            'wex': 'WEX',
+            'btcn': 'BTCChina',
+            'btsp': 'Bitstamp',
+            'bfx': 'Bitfinex',
+            'gdax': 'GDAX',
+            'gem': 'Gemini',
+            'krk': 'Kraken'
+        }
+        
+        self._parseMarketDocstrings()
+        
+    def _parseMarketDocstrings(self):
+        attrs = inspect.getmembers(self, predicate=inspect.ismethod)
+        attrs = filter(lambda x: x[0][0] != '_' and x[1].__func__.__doc__ is not None, attrs)
+        attrs = filter(lambda x: re.search('%market%', x[1].__func__.__doc__), attrs)
+        def _changedoc(x):
+            x[1].__func__.__doc__ = re.sub("%market%", self.ticker_supported_markets[self.registryValue('defaultExchange')], x[1].__func__.__doc__)
+        map(_changedoc, attrs)
 
     def _queryYahooRate(self, cur1, cur2):
         try:
@@ -144,6 +172,8 @@ class Market(callbacks.Plugin):
             pass # oh well, try again later.
 
     def _getBtspDepth(self, currency='USD'):
+        apiurl = 'https://www.bitstamp.net/api/v2/order_book/btc{currency}/'
+        urlcurrency = currency.lower()
         if world.testing: # avoid hammering api when testing.
             depth = json.load(open('/tmp/bitstamp.depth.json'))
             depth['bids'] = [{'price':float(b[0]), 'amount':float(b[1])} for b in depth['bids']]
@@ -157,11 +187,12 @@ class Market(callbacks.Plugin):
         except KeyError:
             pass
         yahoorate = 1
-        if currency != 'USD':
+        if currency not in ['USD','EUR']:
             yahoorate = float(self._queryYahooRate('USD', currency))
+            urlcurrency = 'usd'
         try:
             stddepth = {}
-            data = urlopen('https://www.bitstamp.net/api/order_book/').read()
+            data = urlopen(apiurl.format(currency=urlcurrency)).read()
             vintage = time.time()
             depth = json.loads(data)
             # make consistent format with mtgox
@@ -228,7 +259,7 @@ class Market(callbacks.Plugin):
         yahoorate = 1
         try:
             stddepth = {}
-            data = urlopen('https://api.bitfinex.com/v1/book/BTCUSD').read()
+            data = urlopen('https://api.bitfinex.com/v1/book/BTCUSD?limit_asks=10000&limit_bids=10000').read()
             depth = json.loads(data)
             vintage = time.time()
             if depth.has_key('message'):
@@ -243,7 +274,6 @@ class Market(callbacks.Plugin):
             stddepth.update({'bids': [{'price':float(b['price'])*yahoorate, 'amount':float(b['amount'])} for b in depth['bids']],
                     'asks': [{'price':float(b['price'])*yahoorate, 'amount':float(b['amount'])} for b in depth['asks']]})
             self.depth_cache['bfx'+currency] = {'time':vintage, 'depth':stddepth}
-            print 'moo'
         except:
             traceback.print_exc()
             pass # oh well, try again later.
@@ -251,6 +281,7 @@ class Market(callbacks.Plugin):
     def _getBtceDepth(self, currency='USD'):
         if world.testing: # avoid hammering api when testing.
             depth = json.load(open('/tmp/btce.depth.json'))
+            depth = depth['btc_%s' % (currency.lower(),)]
             depth['bids'] = [{'price':float(b[0]), 'amount':float(b[1])} for b in depth['bids']]
             depth['asks'] = [{'price':float(b[0]), 'amount':float(b[1])} for b in depth['asks']]
             self.depth_cache['btce'+currency] = {'time':time.time(), 'depth':depth}
@@ -264,13 +295,14 @@ class Market(callbacks.Plugin):
         yahoorate = 1
         try:
             stddepth = {}
-            data = urlopen('https://btc-e.com/api/2/btc_%s/depth' % (currency.lower(),)).read()
+            data = urlopen('https://wex.nz/api/3/depth/btc_%s' % (currency.lower(),)).read()
             depth = json.loads(data)
+            depth = depth['btc_%s' % (currency.lower(),)]
             vintage = time.time()
             if depth.has_key('error'):
                 if "invalid pair" in depth['error']:
                     # looks like we have unsupported currency, default to EUR
-                    depth = json.loads(urlopen("https://btc-e.com/api/2/btc_usd/depth").read())
+                    depth = json.loads(urlopen("https://wex.nz/api/3/depth/btc_usd").read())
                     if depth.has_key('error'):
                         return # oh well try again later
                     try:
@@ -284,8 +316,10 @@ class Market(callbacks.Plugin):
             stddepth.update({'bids': [{'price':float(b[0])*yahoorate, 'amount':float(b[1])} for b in depth['bids']],
                     'asks': [{'price':float(b[0])*yahoorate, 'amount':float(b[1])} for b in depth['asks']]})
             self.depth_cache['btce'+currency] = {'time':vintage, 'depth':stddepth}
+            self.depth_cache['wex'+currency] = {'time':vintage, 'depth':stddepth}
         except:
             pass # oh well, try again later.
+    _getWexDepth = _getBtceDepth
 
     def _getBcentDepth(self, currency='EUR'):
         if world.testing: # avoid hammering api when testing.
@@ -304,7 +338,7 @@ class Market(callbacks.Plugin):
         yahoorate = 1
         try:
             stddepth = {}
-            data = urlopen('https://bitcoin-central.net/api/v1/data/eur/depth').read()
+            data = urlopen('https://paymium.com/api/v1/data/eur/depth').read()
             depth = json.loads(data)
             vintage = time.time()
             if currency != 'EUR':
@@ -346,6 +380,78 @@ class Market(callbacks.Plugin):
             depth['asks'].reverse() # asks should be listed in ascending order
             self.depth_cache['btcn'+currency] = {'time':vintage, 'depth':depth}
         except:
+            pass # oh well, try again later.
+
+    def _getGemDepth(self, currency='USD'):
+        if world.testing: # avoid hammering api when testing.
+            depth = json.load(open('/tmp/gem.depth.json'))
+            depth['bids'] = [{'price':float(b[0]), 'amount':float(b[1])} for b in depth['bids']]
+            depth['asks'] = [{'price':float(b[0]), 'amount':float(b[1])} for b in depth['asks']]
+            self.depth_cache['gem'+currency] = {'time':time.time(), 'depth':depth}
+            return
+        try:
+            cachedvalue = self.depth_cache['gem'+currency]
+            if time.time() - cachedvalue['time'] < self.registryValue('fullDepthCachePeriod'):
+                return
+        except KeyError:
+            pass
+        yahoorate = 1
+        try:
+            stddepth = {}
+            depth = json.load(urlopen('https://api.gemini.com/v1/book/BTCUSD'))
+            vintage = time.time()
+            if 'message' in depth:
+                return # looks like an error, try again later
+            if currency != 'USD':
+                try:
+                    stddepth['warning'] = "using yahoo currency conversion"
+                    yahoorate = float(self._queryYahooRate('USD', currency))
+                except:
+                    return # guess yahoo is failing
+            # make consistent format with mtgox original format
+            stddepth.update({
+                'bids': [{'price':float(b['price'])*yahoorate, 'amount':float(b['amount'])} for b in depth['bids']],
+                'asks': [{'price':float(b['price'])*yahoorate, 'amount':float(b['amount'])} for b in depth['asks']]
+            })
+            self.depth_cache['gem'+currency] = {'time':vintage, 'depth':stddepth}
+        except:
+            traceback.print_exc()
+            pass # oh well, try again later.
+
+    def _getGdaxDepth(self, currency='USD'):
+        if world.testing: # avoid hammering api when testing.
+            depth = json.load(open('/tmp/gdax.depth.json'))
+            depth['bids'] = [{'price':float(b[0]), 'amount':float(b[1])} for b in depth['bids']]
+            depth['asks'] = [{'price':float(b[0]), 'amount':float(b[1])} for b in depth['asks']]
+            self.depth_cache['gdax'+currency] = {'time':time.time(), 'depth':depth}
+            return
+        try:
+            cachedvalue = self.depth_cache['gdax'+currency]
+            if time.time() - cachedvalue['time'] < self.registryValue('fullDepthCachePeriod'):
+                return
+        except KeyError:
+            pass
+        yahoorate = 1
+        try:
+            stddepth = {}
+            depth = json.load(urlopen('https://api.gdax.com//products/BTC-USD/book?level=3'))
+            vintage = time.time()
+            if 'message' in depth:
+                return # looks like an error, try again later
+            if currency != 'USD':
+                try:
+                    stddepth['warning'] = "using yahoo currency conversion"
+                    yahoorate = float(self._queryYahooRate('USD', currency))
+                except:
+                    return # guess yahoo is failing
+            # make consistent format with mtgox original format
+            stddepth.update({
+                'bids': [{'price':float(b[0])*yahoorate, 'amount':float(b[1])} for b in depth['bids']],
+                'asks': [{'price':float(b[0])*yahoorate, 'amount':float(b[1])} for b in depth['asks']]
+            })
+            self.depth_cache['gdax'+currency] = {'time':vintage, 'depth':stddepth}
+        except:
+            traceback.print_exc()
             pass # oh well, try again later.
 
     def _getMtgoxTicker(self, currency):
@@ -408,12 +514,12 @@ class Market(callbacks.Plugin):
             pair = '%s_btc' % (currency.lower(),)
         else:
             pair = 'btc_%s' % (currency.lower(),)
-        json_data = urlopen("https://btc-e.com/api/2/%s/ticker" % (pair,)).read()
+        json_data = urlopen("https://wex.nz/api/3/ticker/%s" % (pair,)).read()
         ticker = json.loads(json_data)
         yahoorate = 1
         if ticker.has_key('error'):
             # maybe we have unsupported currency
-            ticker = json.loads(urlopen("https://btc-e.com/api/2/btc_usd/ticker").read())
+            ticker = json.loads(urlopen("https://wex.nz/api/3/ticker/btc_usd").read())
             if ticker.has_key('error'):
                 stdticker = {'error':ticker['error']}
                 return stdticker
@@ -423,7 +529,7 @@ class Market(callbacks.Plugin):
             except:
                 stdticker = {'error':'failed to get currency conversion from yahoo.'}
                 return stdticker
-        ticker = ticker['ticker']
+        ticker = ticker[pair]
         if currency.lower() in ['ltc', 'nmc']:
             stdticker = {'bid': round(1.0/ticker['buy'],6),
                             'ask': round(1.0/ticker['sell'],6),
@@ -442,8 +548,10 @@ class Market(callbacks.Plugin):
                             'avg': float(ticker['avg'])*yahoorate})
         self.ticker_cache['btce'+currency] = {'time':time.time(), 'ticker':stdticker}
         return stdticker
+    _getWexTicker = _getBtceTicker
 
     def _getBtspTicker(self, currency):
+        apiurl = 'https://www.bitstamp.net/api/v2/ticker/btc{currency}/'
         try:
             cachedvalue = self.ticker_cache['bitstamp'+currency]
             if time.time() - cachedvalue['time'] < 3:
@@ -451,16 +559,13 @@ class Market(callbacks.Plugin):
         except KeyError:
             pass
         stdticker = {}
-        json_data = urlopen("https://www.bitstamp.net/api/ticker/").read()
+        if currency in ['USD','EUR']:
+            json_data = urlopen(apiurl.format(currency=currency.lower())).read()
+        else:
+            json_data = urlopen(apiurl.format(currency='usd')).read()
         ticker = json.loads(json_data)
-        try:
-            bcharts = json.loads(urlopen("http://api.bitcoincharts.com/v1/markets.json").read())
-            bcharts = filter(lambda x: x['symbol'] == 'bitstampUSD', bcharts)[0]
-            avg = float(bcharts['avg'])
-        except:
-            avg = 0
         yahoorate = 1
-        if currency != 'USD':
+        if currency not in ['USD','EUR']:
             try:
                 stdticker = {'warning':'using yahoo currency conversion'}
                 yahoorate = float(self._queryYahooRate('USD', currency))
@@ -473,7 +578,7 @@ class Market(callbacks.Plugin):
                             'vol': ticker['volume'],
                             'low': float(ticker['low'])*yahoorate,
                             'high': float(ticker['high'])*yahoorate,
-                            'avg': avg*yahoorate})
+                            'avg': float(ticker['vwap'])*yahoorate})
         self.ticker_cache['bitstamp'+currency] = {'time':time.time(), 'ticker':stdticker}
         return stdticker
 
@@ -523,7 +628,7 @@ class Market(callbacks.Plugin):
         except KeyError:
             pass
         stdticker = {}
-        json_data = urlopen("https://bitcoin-central.net/api/v1/data/eur/ticker").read()
+        json_data = urlopen("https://paymium.com/api/v1/data/eur/ticker").read()
         ticker = json.loads(json_data)
         if ticker.has_key('errors'):
             stdticker = {'error':ticker['errors']}
@@ -585,28 +690,26 @@ class Market(callbacks.Plugin):
             pair = 'ltcbtc'
         else:
             pair = 'btc%s' % (currency.lower(),)
-        json_data = urlopen("https://api.bitfinex.com/v1/ticker/%s" % (pair,)).read()
-        spotticker = json.loads(json_data)
-        json_data = urlopen("https://api.bitfinex.com/v1/today/%s" % (pair,)).read()
-        dayticker = json.loads(json_data)
-        if spotticker.has_key('message') or dayticker.has_key('message'):
-            stdticker = {'error':spotticker.get('message') or dayticker.get('message')}
+        json_data = urlopen("https://api.bitfinex.com/v1/pubticker/%s" % (pair,)).read()
+        ticker = json.loads(json_data)
+        if ticker.has_key('message'):
+            stdticker = {'error':ticker.get('message')}
         else:
             if currency.lower() == 'ltc':
-                stdticker = {'bid': round(1.0/float(spotticker['ask']),6),
-                                'ask': round(1.0/float(spotticker['bid']),6),
-                                'last': round(1.0/float(spotticker['last_price']),6),
-                                'vol': dayticker['volume'],
-                                'low': round(1.0/float(dayticker['high']),6),
-                                'high': round(1.0/float(dayticker['low']),6),
+                stdticker = {'bid': round(1.0/float(ticker['ask']),6),
+                                'ask': round(1.0/float(ticker['bid']),6),
+                                'last': round(1.0/float(ticker['last_price']),6),
+                                'vol': ticker['volume'],
+                                'low': round(1.0/float(ticker['high']),6),
+                                'high': round(1.0/float(ticker['low']),6),
                                 'avg': None}
             else:
-                stdticker = {'bid': spotticker['bid'],
-                                'ask': spotticker['ask'],
-                                'last': spotticker['last_price'],
-                                'vol': dayticker['volume'],
-                                'low': dayticker['low'],
-                                'high': dayticker['high'],
+                stdticker = {'bid': ticker['bid'],
+                                'ask': ticker['ask'],
+                                'last': ticker['last_price'],
+                                'vol': ticker['volume'],
+                                'low': ticker['low'],
+                                'high': ticker['high'],
                                 'avg': None}
         self.ticker_cache['bitfinex'+currency] = {'time':time.time(), 'ticker':stdticker}
         return stdticker
@@ -720,7 +823,7 @@ class Market(callbacks.Plugin):
         except KeyError:
             pass
         try:
-            ticker = json.loads(urlopen('https://api.bitcoinaverage.com/ticker/%s' % (currency,)).read())
+            ticker = json.loads(urlopen('https://apiv2.bitcoinaverage.com/indices/global/ticker/BTC%s' % (currency,)).read())
         except urllib2.HTTPError:
             stdticker = {'error':'Unsupported currency.'}
             return stdticker
@@ -730,10 +833,10 @@ class Market(callbacks.Plugin):
         stdticker = {'bid': float(ticker['bid']),
                             'ask': float(ticker['ask']),
                             'last': float(ticker['last']),
-                            'vol': ticker['total_vol'],
-                            'low': None,
-                            'high': None,
-                            'avg': float(ticker['24h_avg'])}
+                            'vol': ticker['volume'],
+                            'low': float(ticker['low']),
+                            'high': float(ticker['high']),
+                            'avg': float(ticker['averages']['day'])}
         self.ticker_cache['bitcoinaverage'+currency] = {'time':time.time(), 'ticker':stdticker}
         return stdticker
 
@@ -768,6 +871,75 @@ class Market(callbacks.Plugin):
                             'high': None,
                             'avg': None})
         self.ticker_cache['coinbase'+currency] = {'time':time.time(), 'ticker':stdticker}
+        return stdticker
+
+    def _getGemTicker(self, currency):
+        try:
+            cachedvalue = self.ticker_cache['gem'+currency]
+            if time.time() - cachedvalue['time'] < 3:
+                return cachedvalue['ticker']
+        except KeyError:
+            pass
+        stdticker = {}
+
+        if currency.lower() == 'usd':
+            yahoorate = 1
+        else:
+            stdticker['warning'] = {'using yahoo currency conversion'}
+            try:
+                yahoorate = float(self._queryYahooRate('USD', currency))
+            except:
+                return {'error':'failed to get currency conversion from yahoo.'}
+        
+        ticker = json.loads(urlopen('https://api.gemini.com/v1/pubticker/BTCUSD').read())
+
+        if 'message' in ticker:
+            stdticker['error'] = ticker.get('message')
+        else:
+            stdticker['bid'] = float(ticker['bid']) * yahoorate
+            stdticker['ask'] = float(ticker['ask']) * yahoorate
+            stdticker['last'] = float(ticker['last']) * yahoorate
+            stdticker['vol'] = float(ticker['volume']['BTC'])
+            stdticker['avg'] = float(ticker['volume']['USD']) / float(ticker['volume']['BTC']) * yahoorate
+            stdticker['low'] = None
+            stdticker['high'] = None
+
+        self.ticker_cache['gem'+currency] = {'time':time.time(), 'ticker':stdticker}
+        return stdticker
+
+    def _getGdaxTicker(self, currency):
+        try:
+            cachedvalue = self.ticker_cache['gdax'+currency]
+            if time.time() - cachedvalue['time'] < 3:
+                return cachedvalue['ticker']
+        except KeyError:
+            pass
+        stdticker = {}
+
+        if currency.lower() == 'usd':
+            yahoorate = 1
+        else:
+            stdticker['warning'] = {'using yahoo currency conversion'}
+            try:
+                yahoorate = float(self._queryYahooRate('USD', currency))
+            except:
+                return {'error':'failed to get currency conversion from yahoo.'}
+        
+        ticker = json.loads(urlopen('https://api.gdax.com/products/BTC-USD/ticker').read())
+        stats = json.loads(urlopen('https://api.gdax.com/products/BTC-USD/stats').read())
+        
+        if 'message' in ticker or 'message' in stats:
+            stdticker['error'] = ticker.get('message', 'no ticker error') + stats.get('message' + 'no stats error')
+        else:
+            stdticker['bid'] = float(ticker['bid']) * yahoorate
+            stdticker['ask'] = float(ticker['ask']) * yahoorate
+            stdticker['last'] = float(ticker['price']) * yahoorate
+            stdticker['vol'] = float(ticker['volume'])
+            stdticker['avg'] = None
+            stdticker['low'] = float(stats['low']) * yahoorate
+            stdticker['high'] = float(stats['high']) * yahoorate
+
+        self.ticker_cache['gdax'+currency] = {'time':time.time(), 'ticker':stdticker}
         return stdticker
 
     def _getBitmyntTicker(self, currency):
@@ -840,12 +1012,12 @@ class Market(callbacks.Plugin):
         
         Calculate the effect on the market depth of a market sell order of
         <value> bitcoins. 
-        If <market> is provided, uses that exchange. Default is Bitstamp.
+        If <market> is provided, uses that exchange. Default is %market%.
         If --currency XXX is provided, converts to that fiat currency. Default is USD.
         If '--fiat' option is given, <value> denotes the size of the order in fiat.
         """
         od = dict(optlist)
-        market = od.pop('market','btsp')
+        market = od.pop('market',self.registryValue('defaultExchange'))
         currency = od.pop('currency','USD')
         m = self._getMarketInfo(market, 'depth')
         if m is None:
@@ -933,12 +1105,12 @@ class Market(callbacks.Plugin):
         
         Calculate the effect on the market depth of a market buy order of
         <value> bitcoins. 
-        If <market> is provided, uses that exchange. Default is Bitstamp.
+        If <market> is provided, uses that exchange. Default is %market%.
         If --currency XXX is provided, converts to that fiat currency. Default is USD.
         If '--fiat' option is given, <value> denotes the size of the order in fiat.
         """
         od = dict(optlist)
-        market = od.pop('market','btsp')
+        market = od.pop('market',self.registryValue('defaultExchange'))
         currency = od.pop('currency','USD')
         m = self._getMarketInfo(market, 'depth')
         if m is None:
@@ -991,11 +1163,11 @@ class Market(callbacks.Plugin):
         
         Calculate the amount of bitcoins for sale at or under <pricetarget>.
         If '--over' option is given, find coins or at or over <pricetarget>.
-        If market is supplied, uses that exchange. Default is Bitstamp.
+        If market is supplied, uses that exchange. Default is %market%.
         If --currency XXX is provided, converts to that fiat currency. Default is USD.
         """
         od = dict(optlist)
-        market = od.pop('market','btsp')
+        market = od.pop('market',self.registryValue('defaultExchange'))
         currency = od.pop('currency','USD')
         m = self._getMarketInfo(market, 'depth')
         if m is None:
@@ -1033,11 +1205,11 @@ class Market(callbacks.Plugin):
         
         Calculate the amount of bitcoin demanded at or over <pricetarget>.
         If '--under' option is given, find coins or at or under <pricetarget>.
-        If market is supplied, uses that exchange. Default is Bitstamp.
+        If market is supplied, uses that exchange. Default is %market%.
         If --currency XXX is provided, converts to that fiat currency. Default is USD.
         """
         od = dict(optlist)
-        market = od.pop('market','btsp')
+        market = od.pop('market',self.registryValue('defaultExchange'))
         currency = od.pop('currency','USD')
         m = self._getMarketInfo(market, 'depth')
         if m is None:
@@ -1075,11 +1247,11 @@ class Market(callbacks.Plugin):
         
         Calculate the "order book implied price", by finding the weighted
         average price of coins <width> BTC up and down from the spread.
-        If market is supplied, uses that exchange. Default is Bitstamp.
+        If market is supplied, uses that exchange. Default is %market%.
         If --currency XXX is provided, converts to that fiat currency. Default is USD.
         """
         od = dict(optlist)
-        market = od.pop('market','btsp')
+        market = od.pop('market',self.registryValue('defaultExchange'))
         currency = od.pop('currency','USD')
         m = self._getMarketInfo(market, 'depth')
         if m is None:
@@ -1110,10 +1282,10 @@ class Market(callbacks.Plugin):
         
         Calculate the ratio of total volume of bids in currency, to total btc volume of asks.
         If '--currency XXX' option is given, converts to currency denoted by given three-letter currency code. Default is USD.
-        If market is supplied, uses that exchange. Default is Bitstamp.
+        If market is supplied, uses that exchange. Default is %market%.
         """
         od = dict(optlist)
-        market = od.pop('market','btsp')
+        market = od.pop('market',self.registryValue('defaultExchange'))
         currency = od.pop('currency', 'USD')
         m = self._getMarketInfo(market, 'depth')
         if m is None:
@@ -1183,7 +1355,8 @@ class Market(callbacks.Plugin):
     def ticker(self, irc, msg, args, optlist):
         """[--bid|--ask|--last|--high|--low|--avg|--vol] [--currency XXX] [--market <market>|all]
         
-        Return pretty-printed ticker. Default market is Bitstamp. 
+        Return pretty-printed ticker. 
+        If <market> is provided, uses that exchange. Default is %market%.
         If one of the result options is given, returns only that numeric result
         (useful for nesting in calculations).
         
@@ -1193,7 +1366,7 @@ class Market(callbacks.Plugin):
         """
         od = dict(optlist)
         currency = od.pop('currency', 'USD')
-        market = od.pop('market','btsp')
+        market = od.pop('market',self.registryValue('defaultExchange'))
         r = self._getMarketInfo(market)
         if r is None and market.lower() != 'all':
             irc.error("This is not one of the supported markets. Please choose one of %s or 'all'" % (self.ticker_supported_markets.keys(),))
@@ -1208,6 +1381,7 @@ class Market(callbacks.Plugin):
                 irc.error("Failure to retrieve ticker. Try again later.")
                 self.log.info("Problem retrieving ticker. Market %s, Error: %s" %\
                             (market, e,))
+                traceback.print_exc()
                 return
             if ticker.has_key('error'):
                 irc.error('Error retrieving ticker. Details: %s' % (ticker['error'],))
@@ -1227,17 +1401,21 @@ class Market(callbacks.Plugin):
             response = ""
             sumvol = 0
             sumprc = 0
-            for mkt in ['btsp','btce','bfx','cbx','btcn', 'krk', 'bcent']:
+            for mkt in ['btsp','btce','bfx','gdax','btcn', 'krk', 'gem', 'okc']:
                 try:
                     r = self._getMarketInfo(mkt)
                     tck = r[2](currency)
+                    if float(tck['vol']) < 100:
+                        continue
                     response += "%s BTC%s last: %s, vol: %s | " % \
-                            (r[1], currency, tck['last'], tck['vol'])
-                except:
+                            (r[1], currency, round(float(tck['last']),2), round(float(tck['vol']),2))
+                except Exception, e:
+                    self.log.info("Problem retrieving ticker. Market %s, Error: %s" %\
+                            (mkt, e,))
                     continue # we'll just skip this one then
                 sumvol += float(tck['vol'])
                 sumprc += float(tck['vol']) * float(tck['last'])
-            response += "Volume-weighted last average: %s" % (sumprc/sumvol,)
+            response += "Volume-weighted last average: %s" % (round(sumprc/sumvol,2),)
             irc.reply(response)
     ticker = wrap(ticker, [getopts({'bid': '','ask': '','last': '','high': '',
             'low': '', 'avg': '', 'vol': '', 'currency': 'currencyCode', 'market': 'something'})])

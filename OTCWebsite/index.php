@@ -9,9 +9,8 @@
   <div style="float: left; width: 180px; text-align: center;">
    <div style="padding-left: 10px; padding-bottom: 10px; text-align: center; font-family: Helvetica;">
     Visit our sponsors:<br>
-    <a href="https://www.privateinternetaccess.com/pages/buy-vpn/OTC001"><img src="pia.png" title="Private Internet Access VPN" alt="Private Internet Access graphic" style="border-style: none;"></a>
     <hr style="width: 80%;">
-    <a href="http://coinabul.com/?a=247"><img src="coinabul.jpg" title="Coinabul Bitcoin-to-Gold Dealer" alt="Coinabul Graphic" style="border-style: none;"></a>
+    <a href="https://bitvps.com/?bitcoinotc"><img src="bitvps.png" title="BitVPS Hosting" alt="BitVPS Graphic" style="border-style: none;"></a>
     <hr style="width: 80%;">
     <a href="http://www.dragons.tl/launchpad.php?referrer=bitcoinotc"><img src="dragonstale.jpg" title="Dragon's Tale MMO" alt="Dragon's Tale Graphic" style="border-style: none;"></a>
    </div>
@@ -19,7 +18,7 @@
   <div style="padding-left: 200px;">
    <div class="contentbox">
     <h2 style="text-align: center;">#bitcoin-otc marketplace</h2>
-    <p>#bitcoin-otc is an <a href="http://en.wikipedia.org/wiki/Over-the-counter_(finance)">over-the-counter</a> marketplace for trading with <a href="http://bitcoin.org">bitcoin</a>. The marketplace is located in #bitcoin-otc channel on the <a href="http://freenode.net">freenode</a> IRC network. If you don't have an IRC client, <a href="http://webchat.freenode.net/?channels=#bitcoin-otc">click here</a> to visit the channel with your web browser.</p>
+    <p>#bitcoin-otc is an <a href="http://en.wikipedia.org/wiki/Over-the-counter_(finance)">over-the-counter</a> marketplace for trading with <a href="http://bitcoin.org">bitcoin</a>. The marketplace is located in #bitcoin-otc channel on the <a href="https://libera.chat/">Libera Chat</a> IRC network. If you don't have an IRC client, <a href="https://web.libera.chat/">click here</a> to visit wth your web browser.</p>
 
     <h4>resources</h4>
     <ul>

@@ -31,12 +31,15 @@
 
 import decimal
 import locale
-import telnetlib
 import threading
 import time
 import re
 import json
 import datetime
+import Queue
+import sys
+import urllib2
+import calendar
 
 import supybot.utils as utils
 from supybot.commands import *
@@ -55,7 +58,6 @@ class MarketMonitor(callbacks.Plugin):
     def __init__(self, irc):
         self.__parent = super(MarketMonitor, self)
         self.__parent.__init__(irc)
-        self.conn = telnetlib.Telnet()
         self.e = threading.Event()
         self.started = threading.Event()
         self.data = ""
@@ -63,44 +65,33 @@ class MarketMonitor(callbacks.Plugin):
         self.marketdata = {}
         # Example: {("mtgox", "USD"): [(volume, price, timestamp),(volume, price, timestamp)], ("th", "USD"): [(volume, price, timestamp)]}
         
-        self.raw = []
-        self.nextsend = 0 # Timestamp for when we can send next. Handling this manually allows better collapsing.
+        self.nextsend = time.time() # Timestamp for when we can send next. Handling this manually allows better collapsing.
+        
+        self.q = Queue.Queue()
+
+    def _start_data_pullers(self):
+        self.data_threads = {}
+        self.markets = self.registryValue('supportedMarkets') # ['Bitstamp', 'GDAX', 'Bitfinex']
+        current_module = sys.modules[__name__]
+        for market in self.markets:
+            self.data_threads[market] = getattr(current_module, 'Read'+market+'Trades')(self.q, market)
+            self.data_threads[market].start()
 
     def __call__(self, irc, msg):
         self.__parent.__call__(irc, msg)
         if not self.started.isSet() and irc.network == self.registryValue('network') and self.registryValue('autostart'):
             self._start(irc)
 
-    def _reconnect(self, repeat=True):
-        while not self.e.isSet():
-            try:
-                self.conn.close()
-                self.conn.open(self.registryValue('server'),
-                                    self.registryValue('port'))
-                return True
-            except Exception, e:
-                # this may get verbose, but let's leave this in for now.
-                self.log.error('MarketMonitor: reconnect error: %s: %s' % \
-                            (e.__class__.__name__, str(e)))
-                if not repeat:
-                    return False
-                time.sleep(5)
-
     def _monitor(self, irc):
         while not self.e.isSet():
             try:
-                lines = self.conn.read_very_eager()
-            except Exception, e:
-                self.log.error('Error in MarketMonitor reading telnet: %s: %s' % \
-                            (e.__class__.__name__, str(e)))
-                self._reconnect()
+                chunk = self.q.get(True, 10)
+                k,v = chunk.items()[0]
+                self.marketdata[k] = v
+            except Queue.Empty:
                 continue
-            try:
-                if irc.getCallback('Services').identified and lines: #Make sure you're running the Services plugin, and are identified!
-                    lines = lines.split("\n")
-                    self._parse(lines)
             except Exception, e:
-                self.log.error('Error in MarketMonitor parsing: %s: %s' % \
+                self.log.error('Error in MarketMonitor queue: %s: %s' % \
                             (e.__class__.__name__, str(e)))
                 continue # keep going no matter what
             try:
@@ -112,58 +103,14 @@ class MarketMonitor(callbacks.Plugin):
                                 irc.queueMsg(ircmsgs.privmsg(chan, output))
                         self.nextsend = time.time()+(conf.supybot.protocols.irc.throttleTime() * len(outputs))
                     self.marketdata = {}
-                    self.raw = []
             except Exception, e:
                 self.log.error('Error in MarketMonitor sending: %s: %s' % \
                             (e.__class__.__name__, str(e)))
                 continue # keep going no matter what
             time.sleep(0.01)
         self.started.clear()
-        self.conn.close()
-
-    def _parse(self, msgs):
-        # Stitching of messages
-        if len(msgs) == 1:
-            self.data += msgs[0]
-            return
-        msgs[0] = self.data + msgs[0]
-        self.data = ""
-        if not msgs[-1] == "":
-            self.data = msgs[-1]
-
-        msgs = msgs[:-1]
-
-        if self.registryValue('format') == 'raw':
-            self.raw.extend(msgs)
-
-        #[{"timestamp": 1302015318, "price": "0.7000", "volume": "0.27", "currency": "USD", "symbol": "btcexUSD"}]
-
-        # Parsing of messages
-        for data in msgs:
-            try:
-                d = json.loads(data)
-                for needed in "timestamp", "price", "volume", "symbol":
-                    assert needed in d
-                market, currency = re.match(r"^([a-z0-9]+)([A-Z]+)$", d["symbol"]).groups()
-                volume = decimal.Decimal(str(d["volume"]))
-                price = decimal.Decimal(str(d["price"]))
-                stamp = decimal.Decimal(str(d["timestamp"]))
-                if (market, currency) not in self.marketdata:
-                    self.marketdata[(market, currency)] = []
-                self.marketdata[(market, currency)].append((volume, price, stamp))
-            except Exception, e:
-                # we really want to keep going no matter what data we get
-                self.log.error('Error in MarketMonitor parsing: %s: %s' % \
-                                (e.__class__.__name__, str(e)))
-                self.log.error('MarketMonitor: Unrecognized data: %s' % data)
-                self.data = ""
-                return False
 
     def _format(self):
-        if self.registryValue('format') == 'raw':
-            return [x.rstrip() for x in self.raw]
-
-        # Making a pretty output
         outputs = []
         try:
             for (market, currency), txs in self.marketdata.iteritems():
@@ -196,25 +143,23 @@ class MarketMonitor(callbacks.Plugin):
             return False
         return [out for (_,out) in outputs]
 
-    def die(self):
-        self.e.set()
-        self.conn.close()
-        self.__parent.die()
-
     def _start(self, irc):
         if not self.started.isSet():
             self.e.clear()
+            
+            #success = self._reconnect(repeat=False)
+            #if success:
+            t = threading.Thread(target=self._monitor, name='MarketMonitor',
+                                 kwargs={'irc':irc})
+            t.start()
+            if hasattr(irc, 'reply'):
+                irc.reply("Monitoring start successful. Now monitoring market data.")
+            self._start_data_pullers()
             self.started.set()
-            success = self._reconnect(repeat=False)
-            if success:
-                t = threading.Thread(target=self._monitor, name='MarketMonitor',
-                                     kwargs={'irc':irc})
-                t.start()
-                if hasattr(irc, 'reply'):
-                    irc.reply("Monitoring start successful. Now monitoring market data.")
-            else:
-                if hasattr(irc, 'error'):
-                     irc.error("Error connecting to server. See log for details.")
+            
+            #else:
+                #if hasattr(irc, 'error'):
+                     #irc.error("Error connecting to server. See log for details.")
         else:
             irc.error("Monitoring already started.")
 
@@ -225,7 +170,16 @@ class MarketMonitor(callbacks.Plugin):
         """
         irc.reply("Starting market monitoring.")
         self._start(irc)
-    start = wrap(start, ['owner'])
+    start = wrap(start, [('checkCapability', 'monitor')])
+
+    def die(self):
+        self._stop()
+        self.__parent.die()
+
+    def _stop(self):
+        self.e.set()
+        for k,v in self.data_threads.iteritems():
+            v.stop()
 
     def stop(self, irc, msg, args):
         """takes no arguments
@@ -233,8 +187,8 @@ class MarketMonitor(callbacks.Plugin):
         Stops monitoring market data
         """
         irc.reply("Stopping market monitoring.")
-        self.e.set()
-    stop = wrap(stop, ['owner'])
+        self._stop()
+    stop = wrap(stop, [('checkCapability', 'monitor')])
 
     def _moneyfmt(self, value, places=2, curr='', sep=',', dp='.', pos='', neg='-',
         trailneg=''):
@@ -286,6 +240,255 @@ class MarketMonitor(callbacks.Plugin):
         return ''.join(reversed(result))
 
 Class = MarketMonitor
+
+class BaseTradeReader(threading.Thread):
+    def __init__(self, q, market):
+        threading.Thread.__init__(self, name=market+'Monitor')
+        self.q = q
+        self.e = threading.Event()
+        self.market = market
+        self.trades_api_url = ''
+    
+    def run(self):
+        pass
+        
+    def stop(self):
+        self.e.set()
+    
+        
+class ReadBitfinexTrades(BaseTradeReader):
+    def __init__(self, q, market):
+        BaseTradeReader.__init__(self, q, market)
+        self.trades_api_url = 'https://api.bitfinex.com/v1/trades/BTCUSD'
+        self.timestamp = None
+        self.prev_timestamp_tids = []
+        # ?timestamp=epoch
+        #~ [{
+          #~ "timestamp":1444266681,
+          #~ "tid":11988919,
+          #~ "price":"244.8",
+          #~ "amount":"0.03297384",
+          #~ "exchange":"bitfinex",
+          #~ "type":"sell"
+        #~ }]
+        # most recent trade first
+    
+    def run(self):
+        while not self.e.is_set():
+            if self.timestamp is None: # so we don't glom together a day's worth of trades at startup.
+                self.timestamp = time.time() - 600
+            try:
+                data = json.loads(urllib2.urlopen(self.trades_api_url + \
+                        '?timestamp=' + str(self.timestamp)).read())
+            except:
+                time.sleep(1)
+                continue
+            if 'message' in data or len(data) == 0: # some error, or no data
+                time.sleep(1)
+                continue
+            self.timestamp = data[0]['timestamp']
+            
+            timestamp_tids = filter(lambda x: x['timestamp'] == self.timestamp, data)
+            data = filter(lambda x: x['tid'] not in self.prev_timestamp_tids, data)
+            self.prev_timestamp_tids = [t['tid'] for t in timestamp_tids]
+            
+            trades = [(decimal.Decimal(str(t['amount'])),
+                    decimal.Decimal(str(t['price'])),
+                    decimal.Decimal(str(t['timestamp']))) for t in reversed(data)]
+            
+            self.q.put({(self.market, 'USD'): trades})
+            
+            time.sleep(10)
+
+class ReadBitstampTrades(BaseTradeReader):
+    def __init__(self, q, market):
+        BaseTradeReader.__init__(self, q, market)
+        self.trades_api_url = 'https://www.bitstamp.net/api/v2/transactions/btc{currency}/?time=minute'
+        self.currencies = ['USD','EUR']
+        self.prev_tids = {}
+        for cur in self.currencies:
+            self.prev_tids[cur] = []
+
+        #~ date	Unix timestamp date and time.
+        #~ tid	Transaction ID.
+        #~ price	BTC price.
+        #~ amount	BTC amount.
+        #~ type	0 (buy) or 1 (sell).
+        # most recent first
+    
+    def run(self):
+        while not self.e.is_set():
+            for cur in self.currencies:
+                try:
+                    data = json.loads(urllib2.urlopen(self.trades_api_url.format(currency=cur.lower())).read())
+                except:
+                    time.sleep(1)
+                    continue
+                
+                tids = [t['tid'] for t in data]
+                data = filter(lambda x: x['tid'] not in self.prev_tids[cur], data)
+                self.prev_tids[cur] = tids
+                
+                trades = [(decimal.Decimal(str(t['amount'])),
+                        decimal.Decimal(str(t['price'])),
+                        decimal.Decimal(str(t['date']))) for t in reversed(data)]
+
+                self.q.put({(self.market, cur): trades})
+                time.sleep(1)
+                
+            time.sleep(10)
+
+class ReadGDAXTrades(BaseTradeReader):
+    def __init__(self, q, market):
+        BaseTradeReader.__init__(self, q, market)
+        self.trades_api_url = 'https://api.gdax.com/products/BTC-{currency}/trades'
+        self.currencies = ['USD','EUR','GBP']
+        self.prev_tids = {}
+        self.firstrun = {}
+        for cur in self.currencies:
+            self.firstrun[cur] = True
+            self.prev_tids[cur] = []
+    def run(self):
+        while not self.e.is_set():
+            for cur in self.currencies:
+                try:
+                    data = json.loads(urllib2.urlopen(self.trades_api_url.format(currency=cur)).read())
+                except Exception, e:
+                    #self.log.error('Error in MarketMonitor sending: %s: %s' % \
+                    #        (e.__class__.__name__, str(e)))
+                    print "GDAX error", e.__class__.__name__, str(e)
+                    time.sleep(1)
+                    continue
+                tids = [t['trade_id'] for t in data]
+                data = filter(lambda x: x['trade_id'] not in self.prev_tids[cur], data)
+                self.prev_tids[cur] = tids
+                def make_unixtime(s):
+                    s = re.sub("\.\d+", "", s) # remove microsecs, don't need them and they are not always there
+                    t = datetime.datetime.strptime(s.replace('Z','UTC'), '%Y-%m-%dT%H:%M:%S%Z')
+                    return calendar.timegm(t.timetuple())
+                trades = [(decimal.Decimal(str(t['size'])),
+                        decimal.Decimal(str(t['price'])),
+                        decimal.Decimal(str(make_unixtime(t['time'])))) for t in reversed(data)]
+                
+                if self.firstrun[cur]:
+                    t = time.time()
+                    trades = filter(lambda x: t - float(x[2]) < 600, trades)
+                    self.firstrun[cur] = False
+                self.q.put({(self.market, cur): trades})
+                
+                time.sleep(1)
+            
+            time.sleep(10)
+
+class ReadKrakenTrades(BaseTradeReader):
+    def __init__(self, q, market):
+        BaseTradeReader.__init__(self, q, market)
+        self.trades_api_url = 'https://api.kraken.com/0/public/Trades?pair=XBT{currency}&since={prevlast}'
+        self.currencies = ['USD','EUR','GBP','CAD','JPY']
+        self.prev_last = {}
+        self.firstrun = {}
+        for cur in self.currencies:
+            self.firstrun[cur] = True
+            self.prev_last[cur] = ''
+    def run(self):
+        while not self.e.is_set():
+            for cur in self.currencies:
+                try:
+                    data = json.loads(urllib2.urlopen(self.trades_api_url.format(currency=cur, prevlast=self.prev_last[cur])).read())
+                except:
+                    time.sleep(1)
+                    continue
+                if len(data['error']) > 0:
+                    time.sleep(1)
+                    continue
+                data = data['result']
+                self.prev_last[cur] = data['last']
+                data = data['XXBTZ' + cur]
+                if self.firstrun[cur]:
+                    t = time.time()
+                    data = filter(lambda x: t - float(x[2]) < 600, data)
+                    self.firstrun[cur] = False
+                trades = [(decimal.Decimal(str(t[1])),
+                        decimal.Decimal(str(t[0])),
+                        decimal.Decimal(str(t[2]))) for t in data] # in chrono order!
+                
+                self.q.put({(self.market, cur): trades})
+                
+                time.sleep(1)
+            
+            time.sleep(10)
+
+class ReadBtceTrades(BaseTradeReader):
+    def __init__(self, q, market):
+        BaseTradeReader.__init__(self, q, market)
+        self.trades_api_url = 'https://btc-e.com/api/2/btc_{currency}/trades'
+        self.currencies = ['USD','RUR','EUR']
+        self.prev_tids = {}
+        self.firstrun = {}
+        for cur in self.currencies:
+            self.firstrun[cur] = True
+            self.prev_tids[cur] = []
+    def run(self):
+        while not self.e.is_set():
+            for cur in self.currencies:
+                try:
+                    data = json.loads(urllib2.urlopen(self.trades_api_url.format(currency=cur.lower())).read())
+                except:
+                    time.sleep(1)
+                    continue
+                if 'error' in data:
+                    time.sleep(1)
+                    continue
+                tids = [t['tid'] for t in data]
+                data = filter(lambda x: x['tid'] not in self.prev_tids[cur], data)
+                self.prev_tids[cur] = tids
+                trades = [(decimal.Decimal(str(t['amount'])),
+                        decimal.Decimal(str(t['price'])),
+                        decimal.Decimal(str(t['date']))) for t in reversed(data)]
+                
+                if self.firstrun[cur]:
+                    t = time.time()
+                    trades = filter(lambda x: t - float(x[2]) < 600, trades)
+                    self.firstrun[cur] = False
+                self.q.put({(self.market, cur): trades})
+                
+                time.sleep(1)
+            
+            time.sleep(10)
+
+class ReadGeminiTrades(BaseTradeReader):
+    def __init__(self, q, market):
+        BaseTradeReader.__init__(self, q, market)
+        self.trades_api_url = 'https://api.gemini.com/v1/trades/btcusd?limit_trades=500'
+        self.timestamp = None
+        self.prev_timestamp_tids = []
+    
+    def run(self):
+        while not self.e.is_set():
+            if self.timestamp is None: # so we don't glom together old trades at startup.
+                self.timestamp = int(time.time() - 600) # gemini wants integer
+            try:
+                data = json.loads(urllib2.urlopen(self.trades_api_url + \
+                        '&since=' + str(self.timestamp)).read())
+            except:
+                time.sleep(1)
+                continue
+            if 'message' in data or len(data) == 0: # some error, or no data
+                time.sleep(1)
+                continue 
+            self.timestamp = data[0]['timestamp']
+            
+            timestamp_tids = filter(lambda x: x['timestamp'] == self.timestamp, data)
+            data = filter(lambda x: x['tid'] not in self.prev_timestamp_tids, data)
+            self.prev_timestamp_tids = [t['tid'] for t in timestamp_tids]
+            
+            trades = [(decimal.Decimal(str(t['amount'])),
+                    decimal.Decimal(str(t['price'])),
+                    decimal.Decimal(str(t['timestamp']))) for t in reversed(data)]
+            
+            self.q.put({(self.market, 'USD'): trades})
+            
+            time.sleep(10)
 
 
 # vim:set shiftwidth=4 softtabstop=4 expandtab textwidth=79:

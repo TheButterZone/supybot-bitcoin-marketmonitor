@@ -32,10 +32,6 @@ conf.registerGlobalValue(MarketMonitor, 'channels',
 conf.registerGlobalValue(MarketMonitor, 'network',
     registry.String("freenode", """Network that should
     receive monitoring output."""))
-conf.registerGlobalValue(MarketMonitor, 'server',
-    registry.String("bitcoincharts.com", """Server to connect to."""))
-conf.registerGlobalValue(MarketMonitor, 'port',
-    registry.PositiveInteger(27007, """Port to connect to."""))
 conf.registerGlobalValue(MarketMonitor, 'autostart',
     registry.Boolean(False, """If true, will autostart monitoring upon bot
     startup."""))
@@ -43,15 +39,15 @@ conf.registerGlobalValue(MarketMonitor, 'marketsWhitelist',
     registry.SpaceSeparatedListOfStrings("", """Whitelist of markets you
     want to monitor, space separated list of short market names. Leave
     blank to include all."""))
+conf.registerGlobalValue(MarketMonitor, 'marketsBlacklist',
+    registry.SpaceSeparatedListOfStrings("", """Blacklist of markets you
+    want to exclude, space separated list of short market names. Leave
+    blank to include all."""))
 conf.registerGlobalValue(MarketMonitor, 'collapseThreshold',
     registry.Integer(3, """Minimum number of transactions the bot will
     collapse together"""))
-
-class Formats(registry.OnlySomeStrings):
-    validStrings = ('raw', 'pretty')
-
-conf.registerGlobalValue(MarketMonitor, 'format',
-    Formats('raw', """Format of the output. Choose between 'raw', to
-    output messages as-is, and 'pretty', for prettified and aligned output."""))
+conf.registerGlobalValue(MarketMonitor, 'supportedMarkets',
+    registry.SpaceSeparatedListOfStrings("Bitfinex Bitstamp", """List 
+    of markets supported and enabled on this plugin."""))
 
 # vim:set shiftwidth=4 tabstop=4 expandtab textwidth=79:
