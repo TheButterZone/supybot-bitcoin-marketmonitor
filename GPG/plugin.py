@@ -37,6 +37,8 @@ import time
 import copy
 import logging
 import traceback
+import secrets
+from local import nostrsig
 
 try:
     gnupg = utils.python.universalImport('gnupg', 'local.gnupg')
@@ -74,8 +76,21 @@ class GPGDB(object):
             db = sqlite3.connect(self.filename, timeout=10, check_same_thread = False)
             db.text_factory = str
             self.db = db
+            
+            # This safely updates the live, existing production database 
+            # by creating a companion table without altering the 'users' table structure.
+            try:
+                cursor = self.db.cursor()
+                cursor.execute("""CREATE TABLE IF NOT EXISTS user_nostr (
+                                    nick TEXT PRIMARY KEY,
+                                    nostr_pubkey TEXT NOT NULL
+                                );""")
+                self._commit()
+            except Exception:
+                pass
             return
         
+        # If someone downloads the project for a fresh install, this block handles it:
         db = sqlite3.connect(self.filename, timeout=10, check_same_thread = False)
         db.text_factory = str
         self.db = db
@@ -90,6 +105,12 @@ class GPGDB(object):
                           last_authed_at INTEGER,
                           is_authed INTEGER)
                            """)
+        
+        cursor.execute("""CREATE TABLE user_nostr (
+                            nick TEXT PRIMARY KEY,
+                            nostr_pubkey TEXT NOT NULL
+                        );""")
+        
         self._commit()
         return
 
@@ -127,6 +148,12 @@ class GPGDB(object):
         cursor.execute("""INSERT INTO users VALUES
                         (NULL, ?, ?, ?, ?, ?, ?, ?)""",
                         (keyid, fingerprint, bitcoinaddress, timestamp, nick, timestamp, 0))
+        self._commit()
+
+    def set_user_nostr_pubkey(self, nick, nostr_pubkey):
+        """Saves or updates a verified Nostr hex public key string for a user nick."""
+        cursor = self.db.cursor()
+        cursor.execute("INSERT OR REPLACE INTO user_nostr (nick, nostr_pubkey) VALUES (?, ?);", (nick, nostr_pubkey))
         self._commit()
 
     def update_auth_date(self, id, timestamp):
@@ -167,6 +194,14 @@ class GPGDB(object):
         cursor.execute("""UPDATE users SET bitcoinaddress = ?
                         WHERE nick = ? AND (bitcoinaddress = ? OR bitcoinaddress IS NULL)""",
                         (newaddress, nick, oldaddress,))
+        self._commit()
+    
+    def changenostr(self, nick, old_pubkey, new_pubkey):
+        """Updates a user's Nostr public key in the companion table."""
+        cursor = self.db.cursor()
+        cursor.execute("""UPDATE user_nostr SET nostr_pubkey = ?
+                        WHERE nick = ? AND nostr_pubkey = ?""",
+                        (new_pubkey, nick, old_pubkey))
         self._commit()
 
 def getGPGKeyID(irc, msg, args, state, type='GPG key id. Please use the long form 16 digit key id'):
@@ -228,6 +263,7 @@ class GPG(callbacks.Plugin):
             authlog.addHandler(handler)
         self.authlog = authlog
         self.authlog.info("***** loading GPG plugin. *****")
+        self.pending_nostr = {}
 
     def die(self):
         self.__parent.die()
@@ -996,16 +1032,31 @@ class GPG(callbacks.Plugin):
             irc.reply("No such user registered.")
             return
         result = result[0]
-        authhost = self._identByNick(result[5])
+        
+        # 1. Fetch their unique registered account nick name out of the user query payload
+        user_nick = result[5]
+
+        # 2. Look up their companion Nostr profile key using a direct SQLite cursor query
+        try:
+            cursor = self.db.db.cursor()
+            cursor.execute("SELECT nostr_pubkey FROM user_nostr WHERE nick = ?;", (user_nick,))
+            row = cursor.fetchone()
+            nostr_display = row[0] if row else "None"
+        except Exception:
+            nostr_display = "None"
+
+        authhost = self._identByNick(user_nick)
         if authhost is not None:
             authstatus = " Currently authenticated from hostmask %s ." % (authhost,)
-            if authhost.split('!')[0].upper() != result[5].upper():
+            if authhost.split('!')[0].upper() != user_nick.upper():
                 authstatus += " CAUTION: irc nick differs from otc registered nick."
         else:
             authstatus = " Currently not authenticated."
-        irc.reply("User '%s', with keyid %s, fingerprint %s, and bitcoin address %s, registered on %s, last authed on %s. http://b-otc.com/vg?nick=%s .%s" %\
-                (result[5], result[1], result[2], result[3], time.ctime(result[4]),
-                time.ctime(result[6]), utils.web.urlquote(result[5]), authstatus))
+            
+        # 3. Output string formatted with the added Nostr profile key metric
+        irc.reply("User '%s', with keyid %s, fingerprint %s, bitcoin address %s, and nostr pubkey %s, registered on %s, last authed on %s. http://b-otc.com/vg?nick=%s .%s" %\
+                (user_nick, result[1], result[2], result[3], nostr_display, time.ctime(result[4]),
+                time.ctime(result[6]), utils.web.urlquote(user_nick), authstatus))
     info = wrap(info, [getopts({'key': '','address':'',}),'something'])
 
     def stats(self, irc, msg, args):
@@ -1094,6 +1145,139 @@ class GPG(callbacks.Plugin):
             self.authed_users[newprefix] = self.authed_users[msg.prefix]
             self._unauth(irc, msg.prefix)
             self.db.set_auth_status(self.authed_users[newprefix]['nick'], 1)
+
+    def nostrregister(self, irc, msg, args, pubkey_input):
+        """<npub or hex_pubkey>
+        Initiates linking a Nostr public key to your authenticated OTC account.
+        You must be authenticated in order to use this command.
+        """
+        gpgauth = self._ident(msg.prefix)
+        if gpgauth is None:
+            irc.error("You must be authenticated to your OTC account via GPG or Bitcoin signature first.")
+            return
+
+        try:
+            hex_pubkey = nostrsig.decode_bech32_to_hex(pubkey_input)
+        except Exception:
+            irc.error("Could not parse key. Please provide a valid hex string or npub.")
+            return
+
+        # Explicitly ensure they don't already have a key registered if using 'register'
+        # (This matches the behavior users expect between registration vs changes)
+        cursor = self.db.db.cursor()
+        cursor.execute("SELECT nostr_pubkey FROM user_nostr WHERE nick = ?;", (gpgauth['nick'],))
+        if cursor.fetchone():
+            irc.error("You already have a Nostr key linked. Use 'changenostr' to replace it.")
+            return
+
+        challenge_token = secrets.token_hex(8)
+        challenge_str = f"otc-auth:{challenge_token}"
+
+        self.pending_nostr[msg.prefix] = {
+            "pubkey": hex_pubkey,
+            "challenge": challenge_str,
+            "nick": gpgauth['nick'],
+            "type": "nostrregister"
+        }
+
+        irc.reply(f"Request successful for user {gpgauth['nick']}. To verify ownership, use your Nostr profile to publish a public note containing exactly: {challenge_str}")
+        irc.reply("Once published, run: ;;nostrverify <note_id_or_url>")
+    nostrregister = wrap(nostrregister, ['somethingWithoutSpaces'])
+
+    def changenostr(self, irc, msg, args, pubkey_input):
+        """<npub or hex_pubkey>
+        Changes your registered Nostr public key to a new one.
+        You must be authenticated in order to use this command.
+        """
+        gpgauth = self._ident(msg.prefix)
+        if gpgauth is None:
+            irc.error("You must be authenticated to your OTC account via GPG or Bitcoin signature first.")
+            return
+
+        try:
+            hex_pubkey = nostrsig.decode_bech32_to_hex(pubkey_input)
+        except Exception:
+            irc.error("Could not parse key. Please provide a valid hex string or npub.")
+            return
+
+        # Fetch their currently registered key to satisfy the change verification pattern
+        cursor = self.db.db.cursor()
+        cursor.execute("SELECT nostr_pubkey FROM user_nostr WHERE nick = ?;", (gpgauth['nick'],))
+        row = cursor.fetchone()
+        if not row:
+            irc.error("You do not have a Nostr key linked yet. Please use 'nostrregister' first.")
+            return
+        old_pubkey = row[0]
+
+        challenge_token = secrets.token_hex(8)
+        challenge_str = f"otc-auth:{challenge_token}"
+
+        self.pending_nostr[msg.prefix] = {
+            "pubkey": hex_pubkey,
+            "old_pubkey": old_pubkey,
+            "challenge": challenge_str,
+            "nick": gpgauth['nick'],
+            "type": "changenostr"
+        }
+
+        self.authlog.info("changenostr request from hostmask %s for user %s, oldkey %s, newkey %s." %\
+                (msg.prefix, gpgauth['nick'], old_pubkey, hex_pubkey))
+
+        irc.reply(f"Change request successful for user {gpgauth['nick']}. Use your NEW Nostr profile to publish a note containing exactly: {challenge_str}")
+        irc.reply("Once published, submit with: ;;nostrverify <note_id_or_url>")
+    changenostr = wrap(changenostr, ['somethingWithoutSpaces'])
+
+    def nostrverify(self, irc, msg, args, note_input):
+        """<note_id or note_url>
+        Fetches your published verification note and finalizes registration or key changes.
+        """
+        if msg.prefix not in self.pending_nostr:
+            irc.error("No pending Nostr actions found for your hostmask. Run ;;nostrregister or ;;changenostr first.")
+            return
+
+        auth_session = self.pending_nostr[msg.prefix]
+        match = re.search(r'(note1[a-z0-9]+|[a-fA-F0-9]{64})', note_input)
+        if not match:
+            irc.error("Could not parse a valid Nostr Note ID or URL.")
+            return
+            
+        event_id_hex = nostrsig.decode_bech32_to_hex(match.group(1))
+        irc.reply("Fetching verification note from public web relays, please wait...")
+        event_json = nostrsig.fetch_event_by_id(event_id_hex)
+        
+        if not event_json:
+            irc.error("Could not pull that note online. Make sure it has propagated to Primal, Damus, or Nos.lol.")
+            return
+        if event_json.get('pubkey') != auth_session['pubkey']:
+            irc.error("Verification failed: The target note was signed by a different Nostr profile.")
+            return
+        if auth_session['challenge'] not in event_json.get('content', ''):
+            irc.error("Verification failed: Note text is missing your challenge token.")
+            return
+        if not nostrsig.verify_nostr_event_json(event_json):
+            irc.error("Verification failed: Invalid signature mapping.")
+            return
+
+        # Commit to DB depending on the request pathway type
+        try:
+            if auth_session['type'] == 'nostrregister':
+                # Use standard entry block
+                self.db.set_user_nostr_pubkey(auth_session['nick'], auth_session['pubkey'])
+                response = f"Success! Your Nostr identity is now linked to user profile '{auth_session['nick']}'."
+            elif auth_session['type'] == 'changenostr':
+                # Use the new explicit update block
+                self.db.changenostr(auth_session['nick'], auth_session['old_pubkey'], auth_session['pubkey'])
+                response = f"Success! Changed Nostr profile for user {auth_session['nick']} to new key."
+                self.authlog.info(f"changenostr success for {auth_session['nick']} to {auth_session['pubkey']}.")
+
+            del self.pending_nostr[msg.prefix]
+            irc.reply(response)
+        except Exception as e:
+            irc.error(f"Database write error: {str(e)}")
+            
+    nostrverify = wrap(nostrverify, ['somethingWithoutSpaces'])
+
+
 
 Class = GPG
 
