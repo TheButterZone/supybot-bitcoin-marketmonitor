@@ -156,6 +156,21 @@ class GPGDB(object):
         cursor.execute("INSERT OR REPLACE INTO user_nostr (nick, nostr_pubkey) VALUES (?, ?);", (nick, nostr_pubkey))
         self._commit()
 
+    def getByNostrPubkey(self, nostr_pubkey):
+        """Looks up a user record by their registered Nostr public key."""
+        cursor = self.db.cursor()
+        cursor.execute("SELECT nick FROM user_nostr WHERE nostr_pubkey = ?;", (nostr_pubkey,))
+        return cursor.fetchall()
+
+    def register_via_nostr(self, nick, nostr_pubkey, timestamp):
+        """Creates a fresh identity row utilizing only a Nostr public key."""
+        cursor = self.db.cursor()
+        cursor.execute("""INSERT INTO users VALUES
+                        (NULL, None, None, None, ?, ?, ?, 0)""",
+                        (timestamp, nick, timestamp))
+        cursor.execute("INSERT INTO user_nostr (nick, nostr_pubkey) VALUES (?, ?);", (nick, nostr_pubkey))
+        self._commit()
+
     def update_auth_date(self, id, timestamp):
         cursor = self.db.cursor()
         cursor.execute("""UPDATE users SET last_authed_at = ? WHERE id = ?""", (timestamp, id,))
@@ -1146,14 +1161,16 @@ class GPG(callbacks.Plugin):
             self._unauth(irc, msg.prefix)
             self.db.set_auth_status(self.authed_users[newprefix]['nick'], 1)
 
-    def nostrregister(self, irc, msg, args, pubkey_input):
-        """<npub or hex_pubkey>
-        Initiates linking a Nostr public key to your authenticated OTC account.
-        You must be authenticated in order to use this command.
+    def nostrregister(self, irc, msg, args, nick, pubkey_input):
+        """<nick> <npub or hex_pubkey>
+
+        Register your identity, associating Nostr public key <npub or hex_pubkey>
+        with <nick>.
+        You will be given a challenge code to publish via Nostr to verify ownership.
         """
-        gpgauth = self._ident(msg.prefix)
-        if gpgauth is None:
-            irc.error("You must be authenticated to your OTC account via GPG or Bitcoin signature first.")
+        # 1. Check database for existing profile nicks
+        if self.db.getByNick(nick):
+            irc.error("Username already registered. Try a different username.")
             return
 
         try:
@@ -1162,27 +1179,43 @@ class GPG(callbacks.Plugin):
             irc.error("Could not parse key. Please provide a valid hex string or npub.")
             return
 
-        # Explicitly ensure they don't already have a key registered if using 'register'
-        # (This matches the behavior users expect between registration vs changes)
-        cursor = self.db.db.cursor()
-        cursor.execute("SELECT nostr_pubkey FROM user_nostr WHERE nick = ?;", (gpgauth['nick'],))
-        if cursor.fetchone():
-            irc.error("You already have a Nostr key linked. Use 'changenostr' to replace it.")
+        if self.db.getByNostrPubkey(hex_pubkey):
+            irc.error("This Nostr public key is already registered to an account profile.")
             return
+
+        # 2. 🔐 Native Security Layer: Fetch legacy name blocks from RatingSystem
+        try:
+            rs = irc.getCallback('RatingSystem')
+            rsdata = rs.db.get(nick)
+            if len(rsdata) != 0:
+                irc.error("This username is reserved for a legacy user. "
+                        "Contact otc administrator to reclaim the account, if "
+                        "you are an oldtimer since before key auth.")
+                return
+        except Exception:
+            # Fallback wrapper if the RatingSystem module is temporarily unmounted
+            pass
 
         challenge_token = secrets.token_hex(8)
         challenge_str = f"otc-auth:{challenge_token}"
 
+        # 3. Queue the request properties 
         self.pending_nostr[msg.prefix] = {
             "pubkey": hex_pubkey,
             "challenge": challenge_str,
-            "nick": gpgauth['nick'],
-            "type": "nostrregister"
+            "nick": nick,
+            "type": "nostrregister",
+            "expiry": time.time() + 600 # 10-minute expiration rule matching bcregister
         }
 
-        irc.reply(f"Request successful for user {gpgauth['nick']}. To verify ownership, use your Nostr profile to publish a public note containing exactly: {challenge_str}")
-        irc.reply("Once published, run: ;;nostrverify <note_id_or_url>")
-    nostrregister = wrap(nostrregister, ['somethingWithoutSpaces'])
+        # 4. Mirror original audit logging configuration patterns
+        self.authlog.info("nostrregister request from hostmask %s for user %s, nostrkey %s." %\
+                (msg.prefix, nick, hex_pubkey, ))
+
+        irc.reply("Request successful for user %s, hostmask %s. Your challenge string is: %s" %\
+                (nick, msg.prefix, challenge_str,))
+    nostrregister = wrap(nostrregister, ['username', 'somethingWithoutSpaces'])
+
 
     def changenostr(self, irc, msg, args, pubkey_input):
         """<npub or hex_pubkey>
@@ -1227,18 +1260,77 @@ class GPG(callbacks.Plugin):
         irc.reply("Once published, submit with: ;;nostrverify <note_id_or_url>")
     changenostr = wrap(changenostr, ['somethingWithoutSpaces'])
 
+    def nostrauth(self, irc, msg, args, nick):
+        """<nick>
+        
+        Initiate authentication for user <nick> using your Nostr identity.
+        You will be given a random challenge string to publish via a Nostr note,
+        and submit to the bot with the 'nostrverify' command.
+        Your passphrase will expire within 10 minutes.
+        """
+        # 1. Clear out native expired authentication requests from the bot's standard cache
+        self._removeExpiredRequests()
+        
+        userdata = self.db.getByNick(nick)
+        if len(userdata) == 0:
+            irc.error("This nick is not registered. Please register.")
+            return
+
+        # 2. Look up the key mapped to this nickname inside the companion table
+        cursor = self.db.db.cursor()
+        cursor.execute("SELECT nostr_pubkey FROM user_nostr WHERE nick = ?;", (nick,))
+        row = cursor.fetchone()
+        if not row:
+            irc.error("You have not registered a nostr public key. Try using auth/eauth instead, or register a key first.")
+            return
+        nostr_pubkey = row[0]
+
+        # 3. Generate a challenge token using the bot's internal standard passphrase function
+        challenge = self._gen_challenge(irc)
+        challenge_str = f"otc-auth:{challenge}"
+
+        # 4. Map the request state to the pending Nostr dictionary tracking cache
+        self.pending_nostr[msg.prefix] = {
+            "pubkey": nostr_pubkey,
+            "challenge": challenge_str,
+            "nick": userdata[0][5], # Safely reference the permanent registration nick
+            "type": "nostrauth",
+            "userdata": userdata,   # Hold native parameters for session injection tracking
+            "expiry": time.time() + 600 # 10-minute expiration rule matching bcauth
+        }
+
+        # 5. Log the initialization parameters to the custom audit logger
+        self.authlog.info("nostrauth request from hostmask %s for user %s, nostrkey %s." %\
+                (msg.prefix, nick, nostr_pubkey, ))
+
+        irc.reply("Request successful for user %s, hostmask %s. Your challenge string is: %s" %\
+                (nick, msg.prefix, challenge_str,))
+    nostrauth = wrap(nostrauth, ['username'])
     def nostrverify(self, irc, msg, args, note_input):
         """<note_id or note_url>
-        Fetches your published verification note and finalizes registration or key changes.
+        
+        Validates an active registration, login, or change challenge by checking note signatures on public web relays.
         """
+        # 1. 🧹 Self-cleaning loop: Remove requests older than 10 minutes from cache
+        now = time.time()
+        expired_keys = [k for k, v in self.pending_nostr.items() if 'expiry' in v and now > v['expiry']]
+        for k in expired_keys:
+            del self.pending_nostr[k]
+
+        # 2. 🔐 Native Presence Layer Check (Mirrors bcverify)
+        if not self._testPresenceInChannels(irc, msg.nick):
+            irc.error("In order to authenticate, you must be present in one "
+                    "of the following channels: %s" % (self.registryValue('channels'),))
+            return
+
         if msg.prefix not in self.pending_nostr:
-            irc.error("No pending Nostr actions found for your hostmask. Run ;;nostrregister or ;;changenostr first.")
+            irc.error("No pending Nostr actions found for your hostmask. Please run ;;nostrregister, ;;nostrauth, or ;;changenostr first.")
             return
 
         auth_session = self.pending_nostr[msg.prefix]
         match = re.search(r'(note1[a-z0-9]+|[a-fA-F0-9]{64})', note_input)
         if not match:
-            irc.error("Could not parse a valid Nostr Note ID or URL.")
+            irc.error("Could not parse a valid Nostr Note ID or URL from your input.")
             return
             
         event_id_hex = nostrsig.decode_bech32_to_hex(match.group(1))
@@ -1249,29 +1341,62 @@ class GPG(callbacks.Plugin):
             irc.error("Could not pull that note online. Make sure it has propagated to Primal, Damus, or Nos.lol.")
             return
         if event_json.get('pubkey') != auth_session['pubkey']:
-            irc.error("Verification failed: The target note was signed by a different Nostr profile.")
+            irc.error("Verification failed: Target signature belongs to a different public key profile.")
             return
         if auth_session['challenge'] not in event_json.get('content', ''):
             irc.error("Verification failed: Note text is missing your challenge token.")
             return
         if not nostrsig.verify_nostr_event_json(event_json):
-            irc.error("Verification failed: Invalid signature mapping.")
+            irc.error("Verification failed: Invalid cryptographic signature mapping.")
             return
 
-        # Commit to DB depending on the request pathway type
+        # 3. Process the state mutation depending on the action lifecycle type
         try:
+            response = ""
             if auth_session['type'] == 'nostrregister':
-                # Use standard entry block
-                self.db.set_user_nostr_pubkey(auth_session['nick'], auth_session['pubkey'])
-                response = f"Success! Your Nostr identity is now linked to user profile '{auth_session['nick']}'."
+                # Day One fresh signup: Insert initial skeleton layout
+                self.db.register_via_nostr(auth_session['nick'], auth_session['pubkey'], time.time())
+                response = "Registration successful. "
+                
             elif auth_session['type'] == 'changenostr':
-                # Use the new explicit update block
+                # Map or alter credentials for an existing profile
                 self.db.changenostr(auth_session['nick'], auth_session['old_pubkey'], auth_session['pubkey'])
-                response = f"Success! Changed Nostr profile for user {auth_session['nick']} to new key."
-                self.authlog.info(f"changenostr success for {auth_session['nick']} to {auth_session['pubkey']}.")
+                response = "Successfully changed Nostr profile key. "
+                
+            elif auth_session['type'] == 'nostrauth':
+                # Normal returning login path
+                response = "Authentication successful. "
+
+            # 4. Pull fresh, complete record profile out of the master database
+            userdata = self.db.getByNick(auth_session['nick'])[0]
+
+            # 5. Populate active user runtime session attributes
+            # Structure matches users table indices: [0]=id, [1]=keyid, [2]=fingerprint, [3]=bitcoinaddress, [5]=nick
+            self.authed_users[msg.prefix] = {
+                'timestamp': time.time(),
+                'keyid': userdata[1],
+                'nick': auth_session['nick'],
+                'bitcoinaddress': userdata[3],
+                'fingerprint': userdata[2]
+            }
+
+            # 6. Push structural broadcast and execution notifications (Mirrors bcverify)
+            logmsg = "nostrverify success from hostmask %s for user %s, nostrkey %s." % \
+                     (msg.prefix, auth_session['nick'], auth_session['pubkey']) + response
+                     
+            self.authlog.info(logmsg)
+            
+            # Persist tracking status down to database files
+            self.db.update_auth_date(userdata[0], time.time())
+            self.db.set_auth_status(userdata[5], 1)
+
+            # Route network message notifications across internal logging channel
+            if not world.testing:
+                irc.queueMsg(ircmsgs.privmsg("#bitcoin-otc-auth", logmsg))
 
             del self.pending_nostr[msg.prefix]
-            irc.reply(response)
+            irc.reply(response + f"You are now authenticated for user '{auth_session['nick']}'.")
+
         except Exception as e:
             irc.error(f"Database write error: {str(e)}")
             
