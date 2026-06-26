@@ -212,11 +212,9 @@ class GPGDB(object):
         self._commit()
     
     def changenostr(self, nick, old_pubkey, new_pubkey):
-        """Updates a user's Nostr public key in the companion table."""
+        """Saves or updates a user's Nostr public key in the companion table."""
         cursor = self.db.cursor()
-        cursor.execute("""UPDATE user_nostr SET nostr_pubkey = ?
-                        WHERE nick = ? AND nostr_pubkey = ?""",
-                        (new_pubkey, nick, old_pubkey))
+        cursor.execute("INSERT OR REPLACE INTO user_nostr (nick, nostr_pubkey) VALUES (?, ?);", (nick, new_pubkey))
         self._commit()
 
 def getGPGKeyID(irc, msg, args, state, type='GPG key id. Please use the long form 16 digit key id'):
@@ -1216,10 +1214,9 @@ class GPG(callbacks.Plugin):
                 (nick, msg.prefix, challenge_str,))
     nostrregister = wrap(nostrregister, ['username', 'somethingWithoutSpaces'])
 
-
     def changenostr(self, irc, msg, args, pubkey_input):
         """<npub or hex_pubkey>
-        Changes your registered Nostr public key to a new one.
+        Adds or changes your registered Nostr public key.
         You must be authenticated in order to use this command.
         """
         gpgauth = self._ident(msg.prefix)
@@ -1233,14 +1230,17 @@ class GPG(callbacks.Plugin):
             irc.error("Could not parse key. Please provide a valid hex string or npub.")
             return
 
-        # Fetch their currently registered key to satisfy the change verification pattern
+        if self.db.getByNostrPubkey(hex_pubkey):
+            irc.error("This Nostr public key is already linked to a user profile.")
+            return
+
+        # Fetch their currently registered key if they have one
         cursor = self.db.db.cursor()
         cursor.execute("SELECT nostr_pubkey FROM user_nostr WHERE nick = ?;", (gpgauth['nick'],))
         row = cursor.fetchone()
-        if not row:
-            irc.error("You do not have a Nostr key linked yet. Please use 'nostrregister' first.")
-            return
-        old_pubkey = row[0]
+        
+        # 🔄 FIXED LOGIC: If no row exists, set old_pubkey to None instead of blocking them!
+        old_pubkey = row[0] if row else None
 
         challenge_token = secrets.token_hex(8)
         challenge_str = f"otc-auth:{challenge_token}"
@@ -1250,13 +1250,16 @@ class GPG(callbacks.Plugin):
             "old_pubkey": old_pubkey,
             "challenge": challenge_str,
             "nick": gpgauth['nick'],
-            "type": "changenostr"
+            "type": "changenostr",
+            "expiry": time.time() + 600
         }
 
+        # Format audit logging description safely
+        old_key_log = old_pubkey if old_pubkey else "None"
         self.authlog.info("changenostr request from hostmask %s for user %s, oldkey %s, newkey %s." %\
-                (msg.prefix, gpgauth['nick'], old_pubkey, hex_pubkey))
+                (msg.prefix, gpgauth['nick'], old_key_log, hex_pubkey))
 
-        irc.reply(f"Change request successful for user {gpgauth['nick']}. Use your NEW Nostr profile to publish a note containing exactly: {challenge_str}")
+        irc.reply(f"Change request successful for user {gpgauth['nick']}. Use your Nostr profile to publish a note containing exactly: {challenge_str}")
         irc.reply("Once published, submit with: ;;nostrverify <note_id_or_url>")
     changenostr = wrap(changenostr, ['somethingWithoutSpaces'])
 
