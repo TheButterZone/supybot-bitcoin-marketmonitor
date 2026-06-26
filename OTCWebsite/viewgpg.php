@@ -5,7 +5,7 @@
 	}
 
 	$sortby = "nick";
-	$validkeys = array('id', 'nick', 'registered_at', 'keyid', 'fingerprint', 'bitcoinaddress', 'last_authed_at', 'is_authed');
+	$validkeys = array('id', 'nick', 'registered_at', 'keyid', 'fingerprint', 'bitcoinaddress', 'nostr_pubkey', 'last_authed_at', 'is_authed');
 
 	$sortorder = "ASC";
 	
@@ -21,7 +21,7 @@
 ?>
 <?php
 	$queryfilter = array();
-	if ($nickfilter != "") $queryfilter[] = "nick LIKE :nick ESCAPE '|'";
+	if ($nickfilter != "") $queryfilter[] = "u.nick LIKE :nick ESCAPE '|'";
 	if (sizeof($queryfilter) != 0) {
 		$queryfilter = " WHERE " . join(' AND ', $queryfilter);
 	}
@@ -32,7 +32,7 @@
 <?php
 	include('querytojson.php');
 	if ($outformat == 'json'){
-		$sql = 'SELECT * FROM users ' . $queryfilter;
+		$sql = 'SELECT u.*, n.nostr_pubkey FROM users u LEFT JOIN user_nostr n ON u.nick = n.nick ' . $queryfilter;
 		$sth = $db->prepare($sql, array(PDO::ATTR_CURSOR => PDO::CURSOR_FWDONLY));
 		$sth->setFetchMode(PDO::FETCH_ASSOC);
 		if ($nickfilter != "") $sth->bindValue(':nick', like($nickfilter, '|'));
@@ -81,7 +81,7 @@ else {
 ?>
    </tr>
 <?php
-	$sql = 'SELECT * FROM users ' . $queryfilter . 'ORDER BY nick COLLATE NOCASE ASC';
+	$sql = 'SELECT u.*, n.nostr_pubkey FROM users u LEFT JOIN user_nostr n ON u.nick = n.nick ' . $queryfilter . ' ORDER BY u.nick COLLATE NOCASE ASC';
 	$sth = $db->prepare($sql, array(PDO::ATTR_CURSOR => PDO::CURSOR_FWDONLY));
 	$sth->setFetchMode(PDO::FETCH_ASSOC);
 	if ($nickfilter != "") $sth->bindValue(':nick', like($nickfilter, '|'));
@@ -101,6 +101,7 @@ else {
     <td><?php echo $entry['keyid']; ?></td>
 	<td><a href ="http://pool.sks-keyservers.net:11371/pks/lookup?op=vindex&search=0x<?php echo $entry['fingerprint']; ?>"><?php echo $entry['fingerprint']; ?></a></td>
 	<td><?php echo $entry['bitcoinaddress']; ?></td>
+	<td><?php echo htmlspecialchars($entry['nostr_pubkey']); ?></td>
 	<td class="nowrap"><?php echo gmdate('Y-m-d H:i:s', $entry['last_authed_at']); ?></td>
 	<td class="nowrap"><?php echo $entry['is_authed'] ? 'true' : 'false'; ?></td>
    </tr>
