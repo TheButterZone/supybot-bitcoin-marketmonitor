@@ -1309,6 +1309,7 @@ class GPG(callbacks.Plugin):
         irc.reply("Request successful for user %s, hostmask %s. Your challenge string is: %s" %\
                 (nick, msg.prefix, challenge_str,))
     nostrauth = wrap(nostrauth, ['username'])
+    
     def nostrverify(self, irc, msg, args, note_input):
         """<note_id or note_url>
         
@@ -1341,7 +1342,7 @@ class GPG(callbacks.Plugin):
         event_json = nostrsig.fetch_event_by_id(event_id_hex)
         
         if not event_json:
-            irc.error("Could not pull that note online. Make sure it has propagated to Primal, Damus, or Nos.lol.")
+            irc.error("Could not pull that note online. Make sure it has propagated to the major relays.")
             return
         if event_json.get('pubkey') != auth_session['pubkey']:
             irc.error("Verification failed: Target signature belongs to a different public key profile.")
