@@ -223,7 +223,7 @@ def ws_read(sock):
 
 
 # =========================
-# FETCH EVENT (FIXED + SAFE)
+# FETCH EVENT (fast first-hit retrieval with relay failover + backoff awareness)
 # =========================
 
 def fetch_event_by_id(event_id_hex):
@@ -234,15 +234,17 @@ def fetch_event_by_id(event_id_hex):
         "wss://relay.primal.net",
         "wss://relay.snort.social",
         "wss://relay.nostr.band"
-    ])[:MAX_RELAY_ATTEMPTS]
+    ])
 
     req = ["REQ", "gribble", {"ids": [event_id_hex]}]
 
     sockets = []
     relay_map = {}
-    start_times = {}
 
-    for relay in relays:
+    # -----------------------------
+    # connect + send phase
+    # -----------------------------
+    for relay in relays[:MAX_RELAY_ATTEMPTS]:
         try:
             u = urlparse(relay)
             host = u.hostname
@@ -256,33 +258,52 @@ def fetch_event_by_id(event_id_hex):
 
             sockets.append(sock)
             relay_map[sock] = relay
-            start_times[sock] = time.time()
 
         except:
             mark_failure(relay)
+            continue
 
     if not sockets:
         return None
 
     try:
-        for _ in range(12):
-            readable, _, _ = select.select(sockets, [], [], 2)
+        start_time = time.time()
+
+        while time.time() - start_time < 6:  # hard global timeout
+
+            readable, _, _ = select.select(sockets, [], [], 1.5)
 
             for s in readable:
                 msg = ws_read(s)
                 relay = relay_map.get(s)
 
-                if isinstance(msg, list):
-                    if msg[0] == "EVENT":
-                        mark_success(relay, time.time() - start_times[s])
-                        return msg[2]
+                if not isinstance(msg, list):
+                    continue
 
-                    if msg[0] == "EOSE":
+                if msg[0] == "EVENT":
+                    event = msg[2]
+                
+                    # strict event identity validation (prevents relay misrouting / cache pollution)
+                    if not isinstance(event, dict):
+                        continue
+                
+                    if event.get("id") != event_id_hex:
+                        continue
+                
+                    mark_success(relay, time.time() - start_time)
+                    return event
+
+                if msg[0] == "EOSE":
+                    try:
                         sockets.remove(s)
                         s.close()
+                    except:
+                        pass
 
             if not sockets:
                 break
+
+        return None
 
     finally:
         for s in sockets:
@@ -290,8 +311,6 @@ def fetch_event_by_id(event_id_hex):
                 s.close()
             except:
                 pass
-
-    return None
 
 
 # =========================
@@ -342,14 +361,16 @@ def verify_nostr_event_json(event_json):
 
         P = Point(curve, px, py)
 
+        tag_hash = hashlib.sha256(b"BIP0340/challenge").digest()
+        
         e = hashlib.sha256(
-            b"BIP0340/challenge" +
-            b"BIP0340/challenge" +
+            tag_hash +
+            tag_hash +
             bytes.fromhex(event_json['sig'][:64]) +
             bytes.fromhex(event_json['pubkey']) +
             bytes.fromhex(event_json['id'])
         ).digest()
-
+        
         e = string_to_number(e) % order
 
         return (s * generator) == (Point(curve, r, py) + e * P)
