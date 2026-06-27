@@ -35,7 +35,7 @@ conf.registerGlobalValue(GPG, 'authRequestTimeout',
     registry.NonNegativeInteger(300, """Time (seconds) for authentication
     requests to time out."""))
 conf.registerGlobalValue(GPG, 'keyservers',
-    registry.String("subset.pool.sks-keyservers.net,pgp.mit.edu", """Default keyservers to
+    registry.String("keyserver.ubuntu.com,pgpkeys.eu", """Default keyservers to
     use for key retrieval. Comma-separated list."""))
 conf.registerGlobalValue(GPG, 'channels',
     registry.String("#bitcoin-otc", """Channels to monitor for user parts
