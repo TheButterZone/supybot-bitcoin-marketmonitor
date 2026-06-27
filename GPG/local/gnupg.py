@@ -1131,7 +1131,7 @@ class GPG(object):
         p = self._open_subprocess(args)
         return self._get_list_output(p, 'scan')
 
-    def search_keys(self, query, keyserver='pgp.mit.edu'):
+    def search_keys(self, query, keyserver='keyserver.ubuntu.com'):
         """ search keyserver by query (using --search-keys option)
 
         >>> import shutil
